@@ -1,0 +1,24 @@
+# LangChain çekirdeği ve modüller
+langchain-core==0.1.43         # Chain yapıları, promptlar, parserlar
+langchain-community==0.0.30    # Community entegre modüller (PDF loader, Chroma, vs)
+langchain-text-splitters==0.0.1 # Chunklama/splitting işlemleri
+langchain-huggingface==0.0.6   # HuggingFace embedding modeli için
+langchain-together==0.0.3      # Together.ai LLM için
+
+# Vektör veritabanı
+chromadb==0.4.24               # Chroma vektör veritabanı
+
+# Embedding modeli
+sentence-transformers==2.2.2   # MiniLM gibi modelleri sağlar
+
+# PDF dosya işleme
+PyMuPDF==1.23.9                # PyPDFLoader için gerekli
+
+# Diğer
+tqdm==4.66.1                   # Progress bar'lar için (bazı LangChain işlemlerinde çıkar)
+numpy==1.26.4                  # Bazı embedding işlemlerinde gerekli olabilir
+
+evaluate==0.4.1
+bert_score==0.3.13
+scikit-learn==1.4.1
+transformers==4.41.1
