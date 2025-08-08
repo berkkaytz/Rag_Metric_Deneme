@@ -11,7 +11,7 @@ from langgraph.graph import StateGraph
 from typing import TypedDict
 import evaluate
 
-#Uploads PDF & Adds them to state.
+# Uploads PDF & Adds them to state.
 def load_pdf_node(state: dict) -> dict:
     loader = PyPDFLoader(state["pdf_path"])
     pages = loader.load()
@@ -24,7 +24,7 @@ def split_chunks_node(state: dict) -> dict:
     state["chunks"] = chunks
     return state
 
-#Creating vektor database.   
+# Creating vektor database.   
 def embed_node(state: dict) -> dict:
     embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     vectorstore = Chroma.from_documents(
@@ -64,7 +64,7 @@ llm = ChatTogether(
 # Chains the prompt, LLM, and output parser together into a RAG-style pipeline.
 rag_chain = prompt_template | llm | StrOutputParser()
 
-#Gathers most relevant documents from vektor database.
+# Gathers most relevant documents from vektor database.
 def retrieval_node(state: dict) -> dict:
     retriever = state["vectorstore"].as_retriever(search_kwargs={"k": 3})
     docs = retriever.invoke(state["question"])
@@ -81,7 +81,7 @@ def rag_node(state: dict) -> dict:
     return state
 
 
-#Metric calculation
+# Metric calculation
 def evaluate_node(state: dict) -> dict:
     _, _, g = score([state["answer"]], [state["context"]], lang="en", verbose=False)
     _, _, cr = score([state["context"]], [state["answer"]], lang="en", verbose=False)
@@ -93,7 +93,7 @@ def evaluate_node(state: dict) -> dict:
         "answer_relevance": ar[0].item()
     }
     return state
-
+# Runs the LangGraph workflow, takes the PDF path and question as initial input, and returns the answer and evaluation metrics.
 def run_graph(pdf_path: str, question: str):
     initial_state = {
         "pdf_path": pdf_path,
@@ -102,9 +102,9 @@ def run_graph(pdf_path: str, question: str):
     final_state = runnable.invoke(initial_state)
     return final_state["answer"], final_state["metrics"]
 
-#Defining LangGraph flow.
+# Defining LangGraph flow.
 class GraphState(TypedDict):
-    
+
     pdf_path: str
     question: str
     pages: list
