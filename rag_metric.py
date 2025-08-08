@@ -8,9 +8,8 @@ from langchain_together import ChatTogether
 from langchain_core.documents import Document
 from bert_score import score
 from langgraph.graph import StateGraph
+from typing import TypedDict
 import evaluate
-from app import question 
-from app import uploaded_pdf
 
 #Uploads PDF & Adds them to state.
 def load_pdf_node(state: dict) -> dict:
@@ -95,9 +94,28 @@ def evaluate_node(state: dict) -> dict:
     }
     return state
 
-#Defining LangGraph flow.
-graph = StateGraph()
+def run_graph(pdf_path: str, question: str):
+    initial_state = {
+        "pdf_path": pdf_path,
+        "question": question
+    }
+    final_state = runnable.invoke(initial_state)
+    return final_state["answer"], final_state["metrics"]
 
+#Defining LangGraph flow.
+class GraphState(TypedDict):
+    
+    pdf_path: str
+    question: str
+    pages: list
+    chunks: list
+    vectorstore: object
+    context: str
+    answer: str
+    metrics: dict
+
+
+graph = StateGraph(GraphState)
 graph.add_node("load_pdf", load_pdf_node)
 graph.add_node("split_chunks", split_chunks_node)
 graph.add_node("embed", embed_node)
@@ -114,11 +132,4 @@ graph.add_edge("rag", "evaluate")
 graph.set_finish_point("evaluate")
 
 runnable = graph.compile()
-
-initial_state = {
-"pdf_path": uploaded_pdf,
-"question": question
-}
-
-final_state = runnable.invoke(initial_state)
 
