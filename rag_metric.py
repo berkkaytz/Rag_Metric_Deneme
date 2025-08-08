@@ -8,11 +8,14 @@ from langchain_together import ChatTogether
 from langchain_core.documents import Document
 import evaluate
 
-def process_pdf(pdf_path: str, question: str):
+def load_pdf_node(state: dict) -> dict:
+    loader = PyPDFLoader(state["pdf_path"])
+    pages = loader.load()
+    state["pages"] = pages 
+    return state
 
-    # Loads the PDF file, splitting it into separate Document objects for each page.
-    loader = PyPDFLoader(pdf_path)
-    pages = loader.load()  # her sayfa bir Document nesnesi
+
+
 
 
     # Splits the documents into overlapping chunks to preserve context across boundaries.
