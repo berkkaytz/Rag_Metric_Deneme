@@ -6,7 +6,11 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_together import ChatTogether
 from langchain_core.documents import Document
+from bert_score import score
+from langgraph.graph import StateGraph
 import evaluate
+from app import question 
+from app import uploaded_pdf
 
 def load_pdf_node(state: dict) -> dict:
     loader = PyPDFLoader(state["pdf_path"])
@@ -14,34 +18,24 @@ def load_pdf_node(state: dict) -> dict:
     state["pages"] = pages 
     return state
 
-
-
-
-
-    # Splits the documents into overlapping chunks to preserve context across boundaries.
-    # Here, each chunk is 1000 characters with a 200-character overlap.
+def split_chunks_node(state: dict) -> dict:
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    chunks = splitter.split_documents(pages)
+    chunks = splitter.split_documents(state["pages"])
+    state["chunks"] = chunks
+    return state
 
     
-    # Initializes the embedding model to convert text chunks into vector representations.
+def embed_node(state: dict) -> dict:
     embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-
-    # Stores the embedded chunks into a Chroma vector database for retrieval.
     vectorstore = Chroma.from_documents(
-        documents=chunks,
+        documents=state["chunks"],
         embedding=embedding_model,
         collection_name="rag_pdf_demo",
         persist_directory="chroma_db"
     )
-
-    # return vectorstore
-    question, context, answer = ask_question(vectorstore, question)
-    metrics = evaluate_metrics(question, context, answer)
-    return answer, metrics
-
-
+    state["vectorstore"] = vectorstore
+    return state
+   
 
 
 # Defines the prompt template used to instruct the LLM how to respond using the provided context.
@@ -70,45 +64,59 @@ llm = ChatTogether(
 # Chains the prompt, LLM, and output parser together into a RAG-style pipeline.
 rag_chain = prompt_template | llm | StrOutputParser()
 
-def ask_question(vectorstore, question: str):
-    
-    # Converts the vectorstore into a retriever to fetch relevant documents based on the question.
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-    docs: list[Document] = retriever.invoke(question)
-
-    # Combines the retrieved documents into a single context string.
+def retrieval_node(state: dict) -> dict:
+    retriever = state["vectorstore"].as_retriever(search_kwargs={"k": 3})
+    docs = retriever.invoke(state["question"])
     context = "\n\n".join([doc.page_content for doc in docs])
+    state["context"] = context
+    return state
 
-    # Uses the RAG chain to generate an answer from the question and retrieved context.
+def rag_node(state: dict) -> dict:
     answer = rag_chain.invoke({
-        "context": context,
-        "question": question
+        "context": state["context"],
+        "question": state["question"]
     })
+    state["answer"] = answer
+    return state
 
-    print("🧠 Cevap:", answer)
-    return question, context, answer
 
-# Imports the BERTScore metric for evaluating answer quality.
-from bert_score import score
 
-def evaluate_metrics(question: str, context: str, answer: str):
-    
-    # Measures groundedness: how well the answer is supported by the retrieved context.
-    _, _, groundedness_f1 = score([answer], [context], lang="en", verbose=False)
-    
-    # Measures context relevance: how well the context covers the answer.
-    _, _, context_rel_f1 = score([context], [answer], lang="en", verbose=False)
-    
-    # Measures answer relevance: how well the answer relates to the original question.
-    _, _, answer_rel_f1 = score([answer], [question], lang="en", verbose=False)
-    
-    print("📊 Metrikler:")
-    print(f"groundedness: {groundedness_f1[0]:.3f}")
-    print(f"context_relevance: {context_rel_f1[0]:.3f}")
-    print(f"answer_relevance: {answer_rel_f1[0]:.3f}")
-    
-    return {
-        "groundedness": groundedness_f1[0].item(),
-        "context_relevance": context_rel_f1[0].item(),
-        "answer_relevance": answer_rel_f1[0].item()
+def evaluate_node(state: dict) -> dict:
+    _, _, g = score([state["answer"]], [state["context"]], lang="en", verbose=False)
+    _, _, cr = score([state["context"]], [state["answer"]], lang="en", verbose=False)
+    _, _, ar = score([state["answer"]], [state["question"]], lang="en", verbose=False)
+
+    state["metrics"] = {
+        "groundedness": g[0].item(),
+        "context_relevance": cr[0].item(),
+        "answer_relevance": ar[0].item()
     }
+    return state
+
+
+graph = StateGraph()
+
+graph.add_node("load_pdf", load_pdf_node)
+graph.add_node("split_chunks", split_chunks_node)
+graph.add_node("embed", embed_node)
+graph.add_node("retrieval", retrieval_node)
+graph.add_node("rag", rag_node)
+graph.add_node("evaluate", evaluate_node)
+
+graph.set_entry_point("load_pdf")
+graph.add_edge("load_pdf", "split_chunks")
+graph.add_edge("split_chunks", "embed")
+graph.add_edge("embed", "retrieval")
+graph.add_edge("retrieval", "rag")
+graph.add_edge("rag", "evaluate")
+graph.set_finish_point("evaluate")
+
+runnable = graph.compile()
+
+initial_state = {
+"pdf_path": uploaded_pdf,
+"question": question
+}
+
+final_state = runnable.invoke(initial_state)
+
