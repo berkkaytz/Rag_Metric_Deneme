@@ -1,4 +1,4 @@
-from rag_metric import run_graph
+from main import run_graph
 import streamlit as st
 
 st.title("LangGraph RAG Evaluator")
