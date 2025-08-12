@@ -1,5 +1,10 @@
-from imports import PromptTemplate, ChatTogether, StrOutputParser
 import os
+from dotenv import load_dotenv
+from langchain_core.prompts import PromptTemplate
+from langchain_together import ChatTogether
+from langchain_core.output_parsers import StrOutputParser
+
+load_dotenv()
 
 # Defines the prompt template used to instruct the LLM how to respond using the provided context.
 prompt_template = PromptTemplate.from_template("""
@@ -21,7 +26,7 @@ llm = ChatTogether(
     model="mistralai/Mixtral-8x7B-Instruct-v0.1",
     temperature=0.4,
     max_tokens=512,
-    together_api_key="6a761550941ad644f364b032fac79aa5de4172b8abc73cb771cf8c45fb25e83c"
+    together_api_key= os.getenv("TOGETHER_API_KEY")
 )
 
 # Chains the prompt, LLM, and output parser together into a RAG-style pipeline.
