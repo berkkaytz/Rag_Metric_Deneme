@@ -12,6 +12,32 @@ from graph1_pdf_upload import run_graph1
 from graph2 import run_graph2
 from services import llm_generate
 
+# --- Helper: her türlü LLM çıktısını düz metne çevir ---
+def _as_text(x) -> str:
+    """AIMessage / dict / repr('content="..." additional_kwargs=...') → plain text"""
+    # 1) AIMessage benzeri obje
+    if hasattr(x, "content"):
+        try:
+            return x.content
+        except Exception:
+            pass
+    # 2) dict formatı
+    if isinstance(x, dict) and "content" in x:
+        try:
+            return str(x.get("content", ""))
+        except Exception:
+            pass
+    # 3) str'e çevir ve repr kalıbından içeriği ayıkla
+    s = str(x)
+    try:
+        import re
+        m = re.search(r"content=([\\\'\"])(.*?)\1\s+additional_kwargs=", s, re.DOTALL)
+        if m:
+            return m.group(2)
+    except Exception:
+        pass
+    return s
+
 # Sayfa başlığı/ikon ve geniş layout ayarı
 st.set_page_config(page_title="LangGraph RAG Evaluator", page_icon="🧠", layout="wide")
 # Uygulama başlığı
@@ -72,8 +98,9 @@ with chat_container:
     for msg in st.session_state.chat:
         # Mesaj balonu (user/assistant)
         with st.chat_message(msg["role"]):
-            # Mesaj metnini yazdır
-            st.markdown(msg["content"]) 
+            # Mesaj metnini yazdır (sadece düz metin; ham obje ise ayıkla)
+            _content = _as_text(msg.get("content"))
+            st.markdown(_content)
             # (Varsa) bu mesaja ait kaynaklar ve metrikler
             meta = msg.get("meta")
             if meta and msg["role"] == "assistant":
@@ -120,7 +147,7 @@ with chat_container:
                     with st.spinner("RAG (Graph‑2) çalışıyor…"):
                         result = run_graph2(user_input, doc_id=st.session_state.doc_id, max_retries=2)
                     # Modele ait yanıt metni
-                    assistant_text = result.get("answer", "(boş)")
+                    assistant_text = _as_text(result.get("answer", "(boş)"))
                     st.markdown(assistant_text)
                     # Bu tura ait kaynak ve metrikleri anında göster
                     sources = result.get("sources", [])
@@ -150,7 +177,7 @@ with chat_container:
             # LLM’den yanıt al (Together/Ollama via services)
             with st.chat_message("assistant"):
                 with st.spinner("LLM yanıt üretiyor…"):
-                    assistant_text = llm_generate(system, user_input, max_tokens=512)
+                    assistant_text = _as_text(llm_generate(system, user_input, max_tokens=512))
                 st.markdown(assistant_text)
                 # Asistan yanıtını geçmişe ekle
                 st.session_state.chat.append({"role": "assistant", "content": assistant_text})

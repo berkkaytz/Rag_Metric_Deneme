@@ -135,8 +135,9 @@ def generate_node(state: G2State) -> G2State:
         state["answer"] = "I don't know."
         return state
 
-    # LLM’den cevabı iste
-    state["answer"] = rag.invoke({"context": context, "question": state["query"]})
+    # LLM’den cevabı iste ve sadece düz metni sakla
+    result = rag.invoke({"context": context, "question": state["query"]})
+    state["answer"] = result.content if hasattr(result, "content") else (result if isinstance(result, str) else str(result))
     return state
 
 
