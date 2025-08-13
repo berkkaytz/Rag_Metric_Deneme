@@ -1,11 +1,13 @@
 # graph1_pdf_upload.py (LangGraph version)
 from imports import *
-from slugify import slugify
 import os
+
+from services import short_hash_bytes, short_hash_text, iso_now, EMBED_MODEL, slugify
+
+PROJECT_ID = os.getenv("PROJECT_ID", "default_project")
 
 from typing import List, TypedDict
 from langgraph.graph import StateGraph, END
-from services import short_hash_bytes, short_hash_text, iso_now, EMBED_MODEL
 
 
 # --------- State schema ---------
@@ -49,6 +51,8 @@ def split_node(state: G1State) -> G1State:
     )
     state["chunks"] = splitter.split_documents(state["documents"])
     print("[Graph1] split_node: chunks=", len(state["chunks"]))
+    # Resolve project id locally to avoid NameError from globals/imports
+    proj_id = os.getenv("PROJECT_ID", PROJECT_ID if 'PROJECT_ID' in globals() else "default_project")
     # enrich metadata per chunk
     for idx, ch in enumerate(state["chunks"]):
         page = int(ch.metadata.get("page") or 0)
@@ -65,7 +69,7 @@ def split_node(state: G1State) -> G1State:
             "token_count": len(ch_text.split()),
             "hash": short_hash_text(ch_text),
             "embedding_model": EMBED_MODEL,
-            "project_id": PROJECT_ID,
+            "project_id": proj_id,
         })
     return state
 

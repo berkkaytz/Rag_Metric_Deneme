@@ -31,6 +31,44 @@ def _jaccard(a: str, b: str) -> float:
     sa, sb = set(a.lower().split()), set(b.lower().split())
     return (len(sa & sb) / len(sa | sb)) if sa and sb else 0.0
 
+# --- Semantic eval helpers (optional, with safe fallback) ---
+try:
+    from bert_score import score as _bert_score
+except Exception:
+    _bert_score = None
+
+def _extract_pure_answer(text: str) -> str:
+    if not text:
+        return ""
+    cuts = [
+        "🔗 Sources", "Sources / Metadata", "Kaynaklar", "Kaynak alıntıları",
+        "Sources:", "Metadata:", "References"
+    ]
+    for c in cuts:
+        idx = text.find(c)
+        if idx != -1:
+            return text[:idx].strip()
+    return text.strip()
+
+def _top_context_text_from_top_docs(state: G2State, k: int = 5) -> str:
+    top_docs = state.get("top_docs") or []
+    if top_docs and isinstance(top_docs[0], tuple):
+        docs_only = [d for d, _ in top_docs[:k]]
+    else:
+        docs_only = top_docs[:k]
+    return "\n\n---\n\n".join([d.page_content for d in docs_only]) if docs_only else ""
+
+def _safe_bertscore(a: str, b: str) -> float:
+    """Return a semantic similarity in [0,1]; falls back to Jaccard if offline."""
+    if _bert_score is None:
+        return _jaccard(a, b)
+    try:
+        _, _, f1 = _bert_score([a], [b], lang="en", verbose=False)
+        val = float(f1[0])
+        return max(0.0, min(1.0, val))
+    except Exception:
+        return _jaccard(a, b)
+
 # ---------------- Nodes ----------------
 
 def retrieve_node(state: G2State) -> G2State:
@@ -68,21 +106,34 @@ def generate_node(state: G2State) -> G2State:
 
 
 def evaluate_node(state: G2State) -> G2State:
+    # 1) Build compact context from top-k reranked docs
+    context_compact = _top_context_text_from_top_docs(state, k=5)
+    if not context_compact:
+        # fallback to whatever context string exists
+        context_compact = _build_context_string(state.get("top_docs", []))
+
+    # 2) Extract the pure answer text (exclude Sources/Metadata section)
+    answer = _extract_pure_answer(state.get("answer", ""))
+    question = state.get("query", "")
+
+    # 3) Compute metrics (semantic-first with lexical fallback)
+    grounded_sem = _safe_bertscore(answer, context_compact)
+    context_rel  = _safe_bertscore(question, context_compact)
+    answer_rel   = _safe_bertscore(answer, question)
+
+    # Add a small lexical bonus for groundedness using best Jaccard match
     ctx = state.get("top_docs", [])
-    q = state["query"]
-    a = state.get("answer", "")
-    # Context Relevance: average similarity between query and each context chunk
-    cr = sum(_jaccard(q, d.page_content) for d, _ in ctx) / max(len(ctx), 1)
-    # Answer Relevance: similarity between query and answer
-    ar = _jaccard(q, a)
-    # Groundedness: best overlap between answer and any context chunk (slight penalty)
-    g_base = max((_jaccard(a, d.page_content) for d, _ in ctx), default=0.0)
-    g = max(0.0, min(1.0, g_base * 0.95))
+    j_best = max((_jaccard(answer, d.page_content) for d, _ in ctx), default=0.0)
+    grounded = 0.8 * grounded_sem + 0.2 * j_best
+
+    # 4) Round & clamp
+    def _rc(x: float) -> float:
+        return max(0.0, min(1.0, round(float(x), 3)))
 
     state["metrics"] = {
-        "context_relevance": round(cr, 3),
-        "answer_relevance": round(ar, 3),
-        "groundedness": round(g, 3)
+        "context_relevance": _rc(context_rel),
+        "answer_relevance": _rc(answer_rel),
+        "groundedness": _rc(grounded),
     }
     return state
 

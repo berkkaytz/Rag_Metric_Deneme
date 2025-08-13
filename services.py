@@ -25,17 +25,21 @@ if not TOGETHER_API_KEY:
 
 prompt_template = PromptTemplate.from_template(
     """
-    You are a helpful assistant. Answer the user's question **using only** the provided context.
-    - If the answer is not present in the context, reply: "I don't know." Do not hallucinate.
-    - Be concise, clear and polite.
+    You are a RAG assistant. Answer the user's question **using only** the CONTEXT.
+    Rules:
+    - If the answer is not in the context, say exactly: "I don't know." (in English)
+    - Be concise. Prefer bullet points when listing items.
+    - Do not invent facts or numbers. Do not use outside knowledge.
+    - If multiple context chunks disagree, state the uncertainty.
 
-    Context:
+    CONTEXT (verbatim excerpts from the PDF):
     {context}
 
-    Question:
+    QUESTION:
     {question}
 
-    Answer:
+    Write the final answer below. If applicable, include short inline citations like (p.{{page}}) using page hints present in the context text.
+    ANSWER:
     """
 )
 
@@ -46,7 +50,7 @@ TOGETHER_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 # You can change model/temperature/tokens here centrally.
 llm = ChatTogether(
     model=TOGETHER_MODEL,
-    temperature=0.4,
+    temperature=0.2,
     max_tokens=1024,
     together_api_key=TOGETHER_API_KEY,
 )
@@ -75,16 +79,16 @@ def get_rag_chain():
 
 
 # ---------------- CONFIG ----------------
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+EMBED_MODEL = "sentence-transformers/all-mpnet-base-v2"
 RERANK_MODEL = "BAAI/bge-reranker-base"
 PERSIST_DIR = "chroma_db"               # klasörünle uyumlu
 COLLECTION_NAME = "rag_chunks"
 SPLIT_CHARS = 1200
 SPLIT_OVERLAP = 150
 PROJECT_ID = "odine_rag_demo"
-TOP_K_INITIAL = 30
-TOP_R = 5
-RERANK_THRESHOLD = 0.5
+TOP_K_INITIAL = 40
+TOP_R = 6
+RERANK_THRESHOLD = 0.35
 # ----------------------------------------
 
 os.makedirs(PERSIST_DIR, exist_ok=True)

@@ -86,6 +86,24 @@ with chat_container:
                         result = run_graph2(user_input, doc_id=st.session_state.doc_id, max_retries=2)
                     assistant_text = result.get("answer", "(boş)")
                     st.markdown(assistant_text)
+                    # render meta (sources + metrics) immediately for this turn
+                    sources = result.get("sources", [])
+                    metrics = result.get("metrics", {})
+                    if sources:
+                        with st.expander("🔗 Sources / Metadata"):
+                            for s in sources:
+                                st.markdown(
+                                    f"- **page**: {s.get('page')} | **chunk**: `{s.get('chunk_id')}` | **score**: {s.get('rerank_score'):.3f}\n\n"
+                                    f"  **title/section**: {s.get('title') or s.get('section') or '-'}\n\n"
+                                    f"  _{s.get('snippet', '')}_\n"
+                                )
+                    if metrics:
+                        cols = st.columns(3)
+                        keys = ["context_relevance", "answer_relevance", "groundedness"]
+                        labels = ["Context Relevance", "Answer Relevance", "Groundedness"]
+                        for i, k in enumerate(keys):
+                            with cols[i]:
+                                st.metric(labels[i], f"{metrics.get(k, 0.0):.3f}")
                     # keep meta for sources + metrics rendering in history
                     meta = {"sources": result.get("sources", []), "metrics": result.get("metrics", {})}
                     st.session_state.chat.append({"role": "assistant", "content": assistant_text, "meta": meta})
