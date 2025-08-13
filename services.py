@@ -1,28 +1,33 @@
-# NOTE: API KEYS
-# - Together API key is read from your environment via .env (TOGETHER_API_KEY)
-# - You can change model/provider later without touching node/graph code.
-# - If TOGETHER_API_KEY is missing, set it in a .env file like:
-#     TOGETHER_API_KEY=your_key_here
-#   or export it in your shell before running Streamlit.
-
+# ================================
+# services.py
+# Ortak servisler: LLM, prompt, embedding, vektör DB, reranker ve küçük yardımcılar.
+# Bu dosyadan graph/node katmanı yalnızca fonksiyon çağırır; config burada merkezidir.
+# ================================
 import os
+# .env dosyasından ortam değişkenlerini (API key vb.) okumak için
 from dotenv import load_dotenv
+# LangChain prompt ve Together Chat arayüzü
 from langchain_core.prompts import PromptTemplate
 from langchain_together import ChatTogether
 from langchain_core.output_parsers import StrOutputParser
+# Reranker (CE) için Sentence-Transformers CrossEncoder
 from sentence_transformers import CrossEncoder
+# Küçük yardımcılar: zaman, hash, regex ve ortak importlar
 from datetime import datetime
 import hashlib
 import re
 from imports import *
 
+# .env içeriğini process ortamına yükler
 load_dotenv()
 
-# Load Together API key from env/.env and warn if missing
+# Together API anahtarını ortamdan çek; yoksa uyarı bas
 TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
 if not TOGETHER_API_KEY:
     print("[WARN] TOGETHER_API_KEY not found in environment (.env). RAG LLM calls will fail until you set it.")
 
+# RAG cevabı için sıkı şablon: sadece CONTEXT kullan, bilinmiyorsa "I don't know."
+# Ayrıca kısa ve sayfa atıflı cevaplar hedeflenir.
 prompt_template = PromptTemplate.from_template(
     """
     You are a RAG assistant. Answer the user's question **using only** the CONTEXT.
@@ -43,11 +48,10 @@ prompt_template = PromptTemplate.from_template(
     """
 )
 
- # Together model (you can change this centrally)
+# Tek noktadan model seçimi (Together kataloğundan)
 TOGETHER_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 
-# Initializes the LLM (Language Model) from Together AI for generating answers.
-# You can change model/temperature/tokens here centrally.
+# LLM istemcisi: sıcaklığı düşürerek deterministik davranış; token limiti 1024
 llm = ChatTogether(
     model=TOGETHER_MODEL,
     temperature=0.2,
@@ -55,8 +59,10 @@ llm = ChatTogether(
     together_api_key=TOGETHER_API_KEY,
 )
 
+# Basit zincir: Prompt → LLM → metni çıkar
 rag_chain = prompt_template | llm | StrOutputParser()
 
+# Düz sohbet/LLM çağrısı için ortak yardımcı (RAG dışı kullanımda da iş görür)
 def llm_generate(system_prompt: str, user_prompt: str, *, temperature: float | None = None, max_tokens: int | None = None) -> str:
     """Unified LLM call through Together.
     - If `temperature`/`max_tokens` are provided, build a temporary ChatTogether with overrides.
@@ -73,12 +79,17 @@ def llm_generate(system_prompt: str, user_prompt: str, *, temperature: float | N
         )
     return local_llm.invoke(prompt)
 
+# Dışarıya zinciri veren küçük sarmalayıcı (UI/graph kolay erişsin diye)
 def get_rag_chain():
     """Expose the RAG chain so Streamlit/app code can pipe context+question easily."""
     return rag_chain
 
 
-# ---------------- CONFIG ----------------
+# ========== RAG CONFIG ==========
+# Embedding ve retrieval ayarları; tek yerden değiştir.
+# all-mpnet-base-v2 → 768d; Chroma koleksiyonunu buna göre oluştur.
+# TOP_K_INITIAL: ilk aday sayısı; TOP_R: LLM'e gidecek üst parçalar
+# RERANK_THRESHOLD: düşükse daha fazla parça tutulur; yüksekse agresif filtreler
 EMBED_MODEL = "sentence-transformers/all-mpnet-base-v2"
 RERANK_MODEL = "BAAI/bge-reranker-base"
 PERSIST_DIR = "chroma_db"               # klasörünle uyumlu
@@ -91,39 +102,38 @@ TOP_R = 6
 RERANK_THRESHOLD = 0.35
 # ----------------------------------------
 
+# Chroma kalıcılık klasörünü garanti et
 os.makedirs(PERSIST_DIR, exist_ok=True)
 
-# singleton-like service objects
+# Embedding nesnesi (Sentence-Transformers tabanlı)
 _embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+# Kalıcı Chroma koleksiyonu; embedding fonksiyonu ile bağlanır
 _vectordb = Chroma(
     collection_name=COLLECTION_NAME,
     embedding_function=_embeddings,
     persist_directory=PERSIST_DIR
 )
+# Reranker (CrossEncoder) isteğe bağlı; inemezse None ile devam ederiz (fallback)
 try:
     _reranker = CrossEncoder(RERANK_MODEL)
 except Exception as e:
     print("[WARN] Reranker initialization failed:", e)
     _reranker = None
 
+# Dış dünyaya tekil embedding nesnesini ver
 def embeddings() -> HuggingFaceEmbeddings:
     return _embeddings
 
+# Dış dünyaya tekil Chroma istemcisini ver
 def vectordb() -> Chroma:
     return _vectordb
 
+# Dış dünyaya (varsa) CrossEncoder'ı ver; yoksa None döner
 def reranker() -> CrossEncoder:
     return _reranker
 
 
-# --- Usage Notes ---
-# - Import services in nodes/graphs like:
-#     from services import vectordb, embeddings, reranker, llm_generate, get_rag_chain
-# - Set TOGETHER_API_KEY in your .env
-# - Vector DB is persisted under PERSIST_DIR; do not recreate per request.
-
-# --- Small helper utilities (exported for imports in graph1) ---
-
+# Küçük yardımcılar: zaman damgası, kısa hash, basit slug
 def iso_now() -> str:
   """Return current UTC time in ISO-8601 format."""
   return datetime.utcnow().isoformat()

@@ -1,14 +1,30 @@
-# graph2.py (LangGraph version)
+# =============================================================
+# graph2.py — RAG Answer Graph (LangGraph)
+# Sorgu → retrieve (vektör arama + re-rank) → generate (LLM) → evaluate (metrik)
+# Retry kapısı ile metrikler eşik altındaysa tekrar üret.
+# Bu dosya sadece Graph‑2 (cevaplama) akışını içerir; ingest Graph‑1’dedir.
+# =============================================================
+# Ortak tipler/objeler (Document, splitter vb.) ve yardımcılar burada toplanır
 from imports import *
+# Servis katmanı: vektör DB, reranker, RAG zinciri ve kalite ayarları
 from services import (
     TOP_K_INITIAL, TOP_R, RERANK_THRESHOLD,
     vectordb, reranker, get_rag_chain, llm_generate
 )
 
+# Tip ipuçları ve LangGraph çekirdeği
 from typing import List, Dict, Any, Tuple, TypedDict, Optional
 from langgraph.graph import StateGraph, END
 
-# ---------------- State ----------------
+# Graph‑2’nin durum sözlüğü (state). Akış boyunca bu anahtarlar güncellenir.
+# - query: Kullanıcı sorusu
+# - doc_id: Hangi PDF’e filtreleneceği (yoksa tüm koleksiyon)
+# - retrieved: İlk vektör arama dönüşü (Document listesi)
+# - reranked: (Document, skor) listesi (CrossEncoder sonrası)
+# - top_docs: LLM’e gidecek (en iyi N) konteks parçaları
+# - answer: LLM cevabı (model tarafından üretilen metin)
+# - metrics: Ölçüm skorları (0..1)
+# - attempt/max_retries/threshold: Retry kontrol parametreleri
 class G2State(TypedDict, total=False):
     query: str
     doc_id: Optional[str]
@@ -21,22 +37,23 @@ class G2State(TypedDict, total=False):
     max_retries: int
     threshold: float
 
-# ---------------- Helpers ----------------
-
+# En iyi N dokümanı tek bir CONTEXT metnine çevir (LLM’e verilecek gövde)
 def _build_context_string(docs: List[Tuple[Document, float]]) -> str:
     return "\n\n---\n\n".join([doc.page_content for doc, _ in docs])
 
 
+# Basit lexical benzerlik (fallback olarak kullanılır)
 def _jaccard(a: str, b: str) -> float:
     sa, sb = set(a.lower().split()), set(b.lower().split())
     return (len(sa & sb) / len(sa | sb)) if sa and sb else 0.0
 
-# --- Semantic eval helpers (optional, with safe fallback) ---
+# Semantic kıyas için BERTScore; offline ortamda import başarısız olabilir → fallback
 try:
     from bert_score import score as _bert_score
 except Exception:
     _bert_score = None
 
+# Cevaptan "Sources/Kaynaklar" bölümünü ayıkla; sadece gerçek yanıtı ölçelim
 def _extract_pure_answer(text: str) -> str:
     if not text:
         return ""
@@ -50,6 +67,7 @@ def _extract_pure_answer(text: str) -> str:
             return text[:idx].strip()
     return text.strip()
 
+# Re‑rank sonrası top‑k konteksi kısa bir metin olarak derle (gürültüyü azaltır)
 def _top_context_text_from_top_docs(state: G2State, k: int = 5) -> str:
     top_docs = state.get("top_docs") or []
     if top_docs and isinstance(top_docs[0], tuple):
@@ -58,6 +76,7 @@ def _top_context_text_from_top_docs(state: G2State, k: int = 5) -> str:
         docs_only = top_docs[:k]
     return "\n\n---\n\n".join([d.page_content for d in docs_only]) if docs_only else ""
 
+# BERTScore yoksa Jaccard’a düşen güvenli semantic skorlayıcı
 def _safe_bertscore(a: str, b: str) -> float:
     """Return a semantic similarity in [0,1]; falls back to Jaccard if offline."""
     if _bert_score is None:
@@ -69,67 +88,91 @@ def _safe_bertscore(a: str, b: str) -> float:
     except Exception:
         return _jaccard(a, b)
 
-# ---------------- Nodes ----------------
-
+# 1) RETRIEVE — Vektör arama + CrossEncoder re‑rank
+# - doc_id varsa sadece ilgili PDF’te ara
+# - İlk adayları k=TOP_K_INITIAL ile getir, CE ile sırala
+# - Eşik altını at, TOP_R kadarını LLM için hazırla
 def retrieve_node(state: G2State) -> G2State:
+    # Paylaşılan Chroma istemcisini al
     db = vectordb()
+    # İsteğe bağlı filtre: sadece bu dokümanın chunk’ları
     filt = {"doc_id": state.get("doc_id")} if state.get("doc_id") else None
+    # İlk vektör arama (embedding uzayında en yakın k aday)
     retrieved: List[Document] = db.similarity_search(state["query"], k=TOP_K_INITIAL, filter=filt)
 
-    # re-rank with cross-encoder
+    # Re‑rank için (soru, aday_parça) çiftlerini hazırla
     pairs = [(state["query"], d.page_content) for d in retrieved]
+    # CrossEncoder puanları (daha ince ayrım)
     if pairs:
         scores = reranker().predict(pairs)
+        # Yüksekten düşüğe sırala
         ranked = sorted(zip(retrieved, list(scores)), key=lambda x: x[1], reverse=True)
     else:
         ranked = []
 
+    # Düşük skorluları ele (eşik)
     filtered = [(d, s) for d, s in ranked if s >= RERANK_THRESHOLD]
+    # LLM’e gidecek en iyi N parça
     top_docs = filtered[:TOP_R] if len(filtered) >= TOP_R else ranked[:TOP_R]
 
+    # Durumu güncelle
     state["retrieved"] = retrieved
     state["reranked"] = ranked
     state["top_docs"] = top_docs
     return state
 
 
+# 2) GENERATE — RAG zinciri ile LLM cevabı üret
+# - Context boşsa "I don't know." dön
+# - Aksi halde prompt → LLM → metin akışı
 def generate_node(state: G2State) -> G2State:
-    # Use the configured RAG chain (prompt -> LLM -> string)
+    # Prompt + LLM + parser zinciri
     rag = get_rag_chain()
+    # Seçilen top parçaları tek bir CONTEXT’e çevir
     context = _build_context_string(state.get("top_docs", []))
+    # Konteks yoksa modelden cevap isteme
     if not context.strip():
         state["answer"] = "I don't know."
         return state
 
+    # LLM’den cevabı iste
     state["answer"] = rag.invoke({"context": context, "question": state["query"]})
     return state
 
 
+# 3) EVALUATE — Metrikler (semantic‑first)
+# - groundedness: answer ↔ context
+# - context_relevance: question ↔ context
+# - answer_relevance: answer ↔ question
+# Not: Metadata/kaynak listesi ölçüme dahil edilmez (pure answer)
 def evaluate_node(state: G2State) -> G2State:
-    # 1) Build compact context from top-k reranked docs
+    # Gürültüyü azalt: top‑k kısa konteks derle
     context_compact = _top_context_text_from_top_docs(state, k=5)
+    # Fallback: elimizdeki top_docs metni
     if not context_compact:
-        # fallback to whatever context string exists
         context_compact = _build_context_string(state.get("top_docs", []))
 
-    # 2) Extract the pure answer text (exclude Sources/Metadata section)
+    # Sadece gerçek yanıtı ölç (kaynak/metadata hariç)
     answer = _extract_pure_answer(state.get("answer", ""))
     question = state.get("query", "")
 
-    # 3) Compute metrics (semantic-first with lexical fallback)
+    # Semantic groundedness (BERTScore varsa)
     grounded_sem = _safe_bertscore(answer, context_compact)
+    # Soru ↔ konteks uyumu
     context_rel  = _safe_bertscore(question, context_compact)
+    # Cevap ↔ soru uyumu
     answer_rel   = _safe_bertscore(answer, question)
 
-    # Add a small lexical bonus for groundedness using best Jaccard match
+    # Lexical bonus: en iyi Jaccard eşleşmesini ekle (küçük ağırlıkla)
     ctx = state.get("top_docs", [])
     j_best = max((_jaccard(answer, d.page_content) for d, _ in ctx), default=0.0)
     grounded = 0.8 * grounded_sem + 0.2 * j_best
 
-    # 4) Round & clamp
+    # Yuvarla ve [0,1] aralığında tut
     def _rc(x: float) -> float:
         return max(0.0, min(1.0, round(float(x), 3)))
 
+    # Metrikleri state’e yaz
     state["metrics"] = {
         "context_relevance": _rc(context_rel),
         "answer_relevance": _rc(answer_rel),
@@ -137,8 +180,7 @@ def evaluate_node(state: G2State) -> G2State:
     }
     return state
 
-# ------------- Conditional routing -------------
-
+# Retry kapısı — tüm metrikler eşik üstündeyse bitir; değilse ve deneme hakkı varsa tekrar üret
 def should_retry(state: G2State) -> str:
     th = state.get("threshold", 0.7)
     mets = state.get("metrics", {})
@@ -150,20 +192,27 @@ def should_retry(state: G2State) -> str:
     return "retry"
 
 
+# Bir sonraki deneme için attempt sayacını artır
 def retry_gate(state: G2State) -> G2State:
     state["attempt"] = state.get("attempt", 0) + 1
     return state
 
-# ---------------- Build & Run ----------------
-
+# Graph tanımı — düğümleri ekle, kenarları çiz, koşullu geçişleri bağla ve derle
 def build_graph2():
+    # Tip güvenli state ile bir grafik oluştur
     g = StateGraph(G2State)
+    
     g.add_node("retrieve", retrieve_node)
+    
     g.add_node("generate", generate_node)
+    
     g.add_node("evaluate", evaluate_node)
+    
     g.add_node("retry_gate", retry_gate)
 
+    # Giriş düğümü
     g.set_entry_point("retrieve")
+    # Akış bağlantıları
     g.add_edge("retrieve", "generate")
     g.add_edge("generate", "evaluate")
 
@@ -176,13 +225,18 @@ def build_graph2():
         },
     )
     g.add_edge("retry_gate", "generate")
+    # Çalıştırılabilir hâle getir
     return g.compile()
 
 
+# Varsayılan metrik eşiği (retry mekanizması için)
 DEFAULT_THRESHOLD = 0.7
 
+# Dışarıdan çağrılan yardımcı: grafiği kur, input state ver, sonucu UI için paketle
 def run_graph2(query: str, doc_id: Optional[str] = None, max_retries: int = 2, threshold: float = DEFAULT_THRESHOLD) -> Dict[str, Any]:
+    # Grafiği derle
     app = build_graph2()
+    # Başlangıç state’i ile grafiği çalıştır
     state: G2State = app.invoke({
         "query": query,
         "doc_id": doc_id,
@@ -191,8 +245,9 @@ def run_graph2(query: str, doc_id: Optional[str] = None, max_retries: int = 2, t
         "threshold": threshold,
     })
 
-    # Prepare UI-friendly sources list
+    # UI dostu kaynak listesi hazırla (sayfa, skor, snippet)
     sources: List[Dict[str, Any]] = []
+    # Top_docs içinden metadata’yı çıkar ve zenginleştir
     for d, score in (state.get("top_docs") or []):
         meta = d.metadata or {}
         sources.append({
@@ -206,6 +261,7 @@ def run_graph2(query: str, doc_id: Optional[str] = None, max_retries: int = 2, t
             "snippet": d.page_content[:250],
         })
 
+    # Cevap + metrikler + kaynaklar paketini döndür
     return {
         "answer": state.get("answer", "I don't know."),
         "metrics": state.get("metrics", {}),
@@ -213,8 +269,11 @@ def run_graph2(query: str, doc_id: Optional[str] = None, max_retries: int = 2, t
     }
 
 
+# Hızlı yerel test (bu dosyayı doğrudan çalıştırırsan)
 if __name__ == "__main__":
+    # Örnek bir çağrı (doc_id verilmeden)
     out = run_graph2("Belgenin ana bulguları nelerdir?", doc_id=None)
+    # Konsola yazdır
     print("\nAnswer:\n", out["answer"]) 
     print("Metrics:", out["metrics"]) 
     print("Sources:", [(s["page"], round(s["rerank_score"], 3)) for s in out["sources"]])
