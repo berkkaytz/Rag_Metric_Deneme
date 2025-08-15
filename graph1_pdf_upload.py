@@ -15,7 +15,7 @@ from services import short_hash_bytes, short_hash_text, iso_now, EMBED_MODEL, sl
 PROJECT_ID = os.getenv("PROJECT_ID", "default_project")
 
 # Tip ipuçları ve LangGraph çekirdeği
-from typing import List, TypedDict
+from typing import List, TypedDict, Iterable, Tuple
 from langgraph.graph import StateGraph, END
 
 
@@ -25,12 +25,14 @@ from langgraph.graph import StateGraph, END
 # - chunks: Parçalanmış (chunk’lanmış) Document listesi
 # - doc_id: Belgeyi tanımlayan deterministik kimlik (slug+hash)
 # - result: Upsert sonucu (log/özet)
+# - trace: İşlem izlerini tutan liste
 class G1State(TypedDict, total=False):
     pdf_path: str
     documents: List[Document]
     chunks: List[Document]
     doc_id: str
     result: str
+    trace: List[str]
 
 # 1) LOAD — PDF’i oku ve deterministik doc_id oluştur
 def load_pdf_node(state: G1State) -> G1State:
@@ -49,6 +51,10 @@ def load_pdf_node(state: G1State) -> G1State:
     state["documents"] = docs
     # Kaç sayfa/Document yüklendiğini logla
     print("[Graph1] load_pdf_node: docs=", len(docs))
+    # Trace güncelle
+    if "trace" not in state or state["trace"] is None:
+        state["trace"] = []
+    state["trace"].append("load_pdf")
     return state
 
 
@@ -96,6 +102,10 @@ def split_node(state: G1State) -> G1State:
             "embedding_model": EMBED_MODEL,
             "project_id": proj_id,
         })
+    # Trace güncelle
+    if "trace" not in state or state["trace"] is None:
+        state["trace"] = []
+    state["trace"].append("split")
     return state
 
 
@@ -115,6 +125,10 @@ def enrich_and_store_node(state: G1State) -> G1State:
 
     # Özet sonucu state’e yaz (UI/CLI log’u için)
     state["result"] = f"upserted={len(state['chunks'])} doc_id={state['doc_id']}"
+    # Trace güncelle
+    if "trace" not in state or state["trace"] is None:
+        state["trace"] = []
+    state["trace"].append("store")
     return state
 
 # Graph tanımı — düğümleri ekle, kenarları bağla ve derle
@@ -146,8 +160,30 @@ def run_graph1(pdf_path: str) -> str:
     out: G1State = app.invoke({"pdf_path": pdf_path})
     # İlerleme/özet bilgisini logla
     print("[Graph1]", out.get("result"))
-    # UI/Graph‑2 için kullanılacak doc_id’yi döndür
-    return out["doc_id"]
+    # UI/Graph‑2 için kullanılacak doc_id ve trace’yi döndür
+    return out["doc_id"], out.get("trace", [])
+
+# Streaming helper: step-by-step execution that yields current node name
+# Yields: "load_pdf" → "split" → "store" and finally ("done", doc_id, trace)
+
+def run_graph1_stream(pdf_path: str) -> Iterable[Tuple[str, str | list]]:
+    state: G1State = {"pdf_path": pdf_path, "trace": []}
+
+    # 1) LOAD
+    yield ("load_pdf", "")
+    state = load_pdf_node(state)
+
+    # 2) SPLIT
+    yield ("split", "")
+    state = split_node(state)
+
+    # 3) STORE
+    yield ("store", "")
+    state = enrich_and_store_node(state)
+
+    # DONE
+    yield ("done", state.get("doc_id", ""))
+    # If UI needs the full trace afterward, it can be read from state or from run_graph1(...)
 
 # Hızlı yerel test (doğrudan çalıştırma)
 if __name__ == "__main__":

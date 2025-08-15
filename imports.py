@@ -9,11 +9,12 @@ from langchain_core.documents import Document
 from bert_score import score
 from langgraph.graph import StateGraph, END
 from typing import TypedDict
-from services import rag_chain
+from services import get_rag_chain
 from services import vectordb, embeddings, reranker
 from langchain_chroma import Chroma
 import os
-
+# Backward-compat: allow calling rag_chain(...) like before
+rag_chain = get_rag_chain
 # Global chunking configuration (used by Graph-1 and Graph-2)
 SPLIT_CHARS = 1000
 SPLIT_OVERLAP = 200

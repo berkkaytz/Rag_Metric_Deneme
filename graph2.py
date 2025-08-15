@@ -13,7 +13,7 @@ from services import (
 )
 
 # Tip ipuçları ve LangGraph çekirdeği
-from typing import List, Dict, Any, Tuple, TypedDict, Optional
+from typing import List, Dict, Any, Tuple, TypedDict, Optional, Iterable
 from langgraph.graph import StateGraph, END
 
 # Graph‑2’nin durum sözlüğü (state). Akış boyunca bu anahtarlar güncellenir.
@@ -28,6 +28,8 @@ from langgraph.graph import StateGraph, END
 class G2State(TypedDict, total=False):
     query: str
     doc_id: Optional[str]
+    doc_ids: Optional[List[str]]
+    model_name: Optional[str]
     retrieved: List[Document]
     reranked: List[Tuple[Document, float]]
     top_docs: List[Tuple[Document, float]]
@@ -36,6 +38,7 @@ class G2State(TypedDict, total=False):
     attempt: int
     max_retries: int
     threshold: float
+    trace: List[str]
 
 # En iyi N dokümanı tek bir CONTEXT metnine çevir (LLM’e verilecek gövde)
 def _build_context_string(docs: List[Tuple[Document, float]]) -> str:
@@ -93,10 +96,18 @@ def _safe_bertscore(a: str, b: str) -> float:
 # - İlk adayları k=TOP_K_INITIAL ile getir, CE ile sırala
 # - Eşik altını at, TOP_R kadarını LLM için hazırla
 def retrieve_node(state: G2State) -> G2State:
+    state.setdefault("trace", []).append("retrieve")
     # Paylaşılan Chroma istemcisini al
     db = vectordb()
-    # İsteğe bağlı filtre: sadece bu dokümanın chunk’ları
-    filt = {"doc_id": state.get("doc_id")} if state.get("doc_id") else None
+    # İsteğe bağlı filtre: tek veya çoklu doküman
+    _doc_ids = state.get("doc_ids")
+    _doc_id  = state.get("doc_id")
+    if _doc_ids:
+        filt = {"doc_id": {"$in": _doc_ids}}
+    elif _doc_id:
+        filt = {"doc_id": _doc_id}
+    else:
+        filt = None
     # İlk vektör arama (embedding uzayında en yakın k aday)
     retrieved: List[Document] = db.similarity_search(state["query"], k=TOP_K_INITIAL, filter=filt)
 
@@ -126,8 +137,9 @@ def retrieve_node(state: G2State) -> G2State:
 # - Context boşsa "I don't know." dön
 # - Aksi halde prompt → LLM → metin akışı
 def generate_node(state: G2State) -> G2State:
+    state.setdefault("trace", []).append("generate")
     # Prompt + LLM + parser zinciri
-    rag = get_rag_chain()
+    rag = get_rag_chain(model_name=state.get("model_name"))
     # Seçilen top parçaları tek bir CONTEXT’e çevir
     context = _build_context_string(state.get("top_docs", []))
     # Konteks yoksa modelden cevap isteme
@@ -147,6 +159,7 @@ def generate_node(state: G2State) -> G2State:
 # - answer_relevance: answer ↔ question
 # Not: Metadata/kaynak listesi ölçüme dahil edilmez (pure answer)
 def evaluate_node(state: G2State) -> G2State:
+    state.setdefault("trace", []).append("evaluate")
     # Gürültüyü azalt: top‑k kısa konteks derle
     context_compact = _top_context_text_from_top_docs(state, k=5)
     # Fallback: elimizdeki top_docs metni
@@ -195,6 +208,7 @@ def should_retry(state: G2State) -> str:
 
 # Bir sonraki deneme için attempt sayacını artır
 def retry_gate(state: G2State) -> G2State:
+    state.setdefault("trace", []).append("retry_gate")
     state["attempt"] = state.get("attempt", 0) + 1
     return state
 
@@ -234,16 +248,18 @@ def build_graph2():
 DEFAULT_THRESHOLD = 0.7
 
 # Dışarıdan çağrılan yardımcı: grafiği kur, input state ver, sonucu UI için paketle
-def run_graph2(query: str, doc_id: Optional[str] = None, max_retries: int = 2, threshold: float = DEFAULT_THRESHOLD) -> Dict[str, Any]:
+def run_graph2(query: str, doc_id: Optional[str] = None, doc_ids: Optional[List[str]] = None, max_retries: int = 2, threshold: float = DEFAULT_THRESHOLD, model_name: Optional[str] = None) -> Dict[str, Any]:
     # Grafiği derle
     app = build_graph2()
     # Başlangıç state’i ile grafiği çalıştır
     state: G2State = app.invoke({
         "query": query,
         "doc_id": doc_id,
+        "doc_ids": doc_ids,
         "attempt": 0,
         "max_retries": max_retries,
         "threshold": threshold,
+        "model_name": model_name,
     })
 
     # UI dostu kaynak listesi hazırla (sayfa, skor, snippet)
@@ -267,8 +283,91 @@ def run_graph2(query: str, doc_id: Optional[str] = None, max_retries: int = 2, t
         "answer": state.get("answer", "I don't know."),
         "metrics": state.get("metrics", {}),
         "sources": sources,
+        "trace": state.get("trace", []),
     }
 
+
+# -------------------------------------------------------------
+# Streaming execution for Graph-2
+# Emits step names as they execute so the UI can update a single line
+# Steps: retrieve -> generate -> evaluate -> (retry_gate -> generate -> evaluate)* -> done
+
+def run_graph2_stream(
+    query: str,
+    doc_id: Optional[str] = None,
+    doc_ids: Optional[List[str]] = None,
+    max_retries: int = 2,
+    threshold: float = DEFAULT_THRESHOLD,
+    model_name: Optional[str] = None,
+) -> Iterable[Tuple[str, Dict[str, Any]]]:
+    """Yield (step_name, payload) as Graph-2 advances.
+
+    Yields:
+      ("retrieve", {})
+      ("generate", {})
+      ("evaluate", {"metrics": {...}})
+      ("retry_gate", {"attempt": int})  # if retry triggered
+      ...
+      ("done", {"result": {...}})
+    """
+    # Initial state
+    state: G2State = {
+        "query": query,
+        "doc_id": doc_id,
+        "doc_ids": doc_ids,
+        "attempt": 0,
+        "max_retries": max_retries,
+        "threshold": threshold,
+        "model_name": model_name,
+        "trace": [],
+    }
+
+    # 1) RETRIEVE
+    yield ("retrieve", {})
+    state = retrieve_node(state)
+
+    # Loop: GENERATE -> EVALUATE (-> RETRY?)
+    while True:
+        # 2) GENERATE
+        yield ("generate", {})
+        state = generate_node(state)
+
+        # 3) EVALUATE
+        state = evaluate_node(state)
+        yield ("evaluate", {"metrics": state.get("metrics", {})})
+
+        # Decide
+        decision = should_retry(state)
+        if decision == "finish":
+            break
+        # else retry
+        yield ("retry_gate", {"attempt": state.get("attempt", 0) + 1})
+        state = retry_gate(state)
+        # (loop continues with generate again)
+
+    # Prepare UI-friendly sources
+    sources: List[Dict[str, Any]] = []
+    for d, score in (state.get("top_docs") or []):
+        meta = d.metadata or {}
+        sources.append({
+            "doc_id": meta.get("doc_id"),
+            "chunk_id": meta.get("chunk_id"),
+            "page": meta.get("page"),
+            "source": meta.get("source"),
+            "section": meta.get("section"),
+            "title": meta.get("title"),
+            "rerank_score": float(score),
+            "snippet": d.page_content[:250],
+        })
+
+    result = {
+        "answer": state.get("answer", "I don't know."),
+        "metrics": state.get("metrics", {}),
+        "sources": sources,
+        "trace": state.get("trace", []),
+    }
+
+    yield ("done", {"result": result})
 
 # Hızlı yerel test (bu dosyayı doğrudan çalıştırırsan)
 if __name__ == "__main__":

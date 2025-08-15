@@ -48,41 +48,74 @@ prompt_template = PromptTemplate.from_template(
     """
 )
 
-# Tek noktadan model seçimi (Together kataloğundan)
-TOGETHER_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+DEFAULT_TOGETHER_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 
-# LLM istemcisi: sıcaklığı düşürerek deterministik davranış; token limiti 1024
-llm = ChatTogether(
-    model=TOGETHER_MODEL,
-    temperature=0.2,
-    max_tokens=1024,
-    together_api_key=TOGETHER_API_KEY,
-)
+# Some Together models require a dedicated endpoint; if selected, we will fallback to default
+REQUIRES_DEDICATED_ENDPOINT = {
+    "google/gemma-2-9b-it",
+}
 
-# Basit zincir: Prompt → LLM → metni çıkar
-rag_chain = prompt_template | llm | StrOutputParser()
+# Dynamic LLM factory (lets UI pick model)
+def get_llm(model_name: str | None = None,
+            temperature: float = 0.2,
+            max_tokens: int = 1024) -> ChatTogether:
+    effective_model = model_name or DEFAULT_TOGETHER_MODEL
+    if effective_model in REQUIRES_DEDICATED_ENDPOINT:
+        # Avoid runtime 400 by falling back silently to the default model
+        effective_model = DEFAULT_TOGETHER_MODEL
+
+    return ChatTogether(
+        model=effective_model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        together_api_key=TOGETHER_API_KEY,
+    )
+
+# Chain factory: Prompt → LLM → String
+def get_rag_chain(model_name: str | None = None,
+                  temperature: float = 0.2,
+                  max_tokens: int = 1024):
+    llm = get_llm(model_name=model_name, temperature=temperature, max_tokens=max_tokens)
+    return prompt_template | llm | StrOutputParser()
 
 # Düz sohbet/LLM çağrısı için ortak yardımcı (RAG dışı kullanımda da iş görür)
-def llm_generate(system_prompt: str, user_prompt: str, *, temperature: float | None = None, max_tokens: int | None = None) -> str:
+def llm_generate(system_prompt: str,
+                 user_prompt: str,
+                 *,
+                 temperature: float | None = None,
+                 max_tokens: int | None = None,
+                 model_name: str | None = None) -> str:
     """Unified LLM call through Together.
-    - If `temperature`/`max_tokens` are provided, build a temporary ChatTogether with overrides.
-    - Otherwise reuse the global `llm` instance.
+    Always returns a plain string (no AIMessage object).
+    If model_name/temperature/max_tokens are provided, use them; otherwise use defaults.
     """
     prompt = f"{system_prompt.strip()}\n\n{user_prompt.strip()}"
-    local_llm = llm
-    if (temperature is not None) or (max_tokens is not None):
-        local_llm = ChatTogether(
-            model=TOGETHER_MODEL,
-            temperature=temperature if temperature is not None else 0.4,
-            max_tokens=max_tokens if max_tokens is not None else 1024,
-            together_api_key=TOGETHER_API_KEY,
-        )
-    return local_llm.invoke(prompt)
+    llm = get_llm(
+        model_name=model_name,
+        temperature=temperature if temperature is not None else 0.2,
+        max_tokens=max_tokens if max_tokens is not None else 1024,
+    )
+    try:
+        resp = llm.invoke(prompt)
+    except Exception as e:
+        msg = str(e).lower()
+        # Together often returns code 'dedicated_endpoint_not_running' for these cases
+        if "dedicated_endpoint_not_running" in msg or "dedicated endpoint" in msg:
+            # Retry once with the default model to keep UX smooth
+            fallback_llm = get_llm(
+                model_name=None,
+                temperature=temperature if temperature is not None else 0.2,
+                max_tokens=max_tokens if max_tokens is not None else 1024,
+            )
+            resp = fallback_llm.invoke(prompt)
+        else:
+            raise
 
-# Dışarıya zinciri veren küçük sarmalayıcı (UI/graph kolay erişsin diye)
-def get_rag_chain():
-    """Expose the RAG chain so Streamlit/app code can pipe context+question easily."""
-    return rag_chain
+    try:
+        # langchain ChatTogether returns an object with `.content`
+        return resp.content  # type: ignore[attr-defined]
+    except Exception:
+        return str(resp)
 
 
 # ========== RAG CONFIG ==========
@@ -137,15 +170,15 @@ def reranker() -> CrossEncoder:
 def iso_now() -> str:
   """Return current UTC time in ISO-8601 format."""
   return datetime.utcnow().isoformat()
-
+#kısa dosyaid üretir hızlı eşleştirmeye olanak sağlar
 def short_hash_bytes(data: bytes, length: int = 8) -> str:
   """Short SHA-256 hex digest of raw bytes."""
   return hashlib.sha256(data).hexdigest()[:length]
-
+#Aynı chunklar tekrar edilmiş mi kontrol eder
 def short_hash_text(text: str, length: int = 8) -> str:
   """Short SHA-256 hex digest of a UTF-8 string."""
   return hashlib.sha256(text.encode("utf-8")).hexdigest()[:length]
-
+#harfleri küçültür sayı ve harf harici karakterleri siler url dostu yapar
 def slugify(value: str) -> str:
   """Return a filesystem/URL-friendly slug (lowercase, hyphen-separated)."""
   value = value.lower()
